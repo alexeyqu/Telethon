@@ -165,7 +165,7 @@ class Conversation(ChatGetter):
         """
         return self._get_message(
             message, self._reply_indices, self._pending_replies, timeout,
-            lambda x, y: x.reply_to_msg_id == y
+            lambda x, y: x.reply_to and x.reply_to.reply_to_msg_id == y
         )
 
     def _get_message(
@@ -336,7 +336,12 @@ class Conversation(ChatGetter):
 
         future = self._client.loop.create_future()
         self._custom[counter] = (event, future)
-        return await self._get_result(future, start_time, timeout, self._custom, counter)
+        try:
+            return await self._get_result(future, start_time, timeout, self._custom, counter)
+        finally:
+            # Need to remove it from the dict if it times out, else we may
+            # try and fail to set the result later (#1618).
+            self._custom.pop(counter, None)
 
     async def _check_custom(self, built):
         for key, (ev, fut) in list(self._custom.items()):
@@ -370,11 +375,12 @@ class Conversation(ChatGetter):
         #      and then another, so they can do that.
         for msg_id, future in list(self._pending_responses.items()):
             self._response_indices[msg_id] = len(self._incoming)
-            future.set_result(response)
+            if future._state != 'CANCELLED':
+                future.set_result(response)
             del self._pending_responses[msg_id]
 
         for msg_id, future in list(self._pending_replies.items()):
-            if msg_id == response.reply_to_msg_id:
+            if response.reply_to and msg_id == response.reply_to.reply_to_msg_id:
                 self._reply_indices[msg_id] = len(self._incoming)
                 future.set_result(response)
                 del self._pending_replies[msg_id]
@@ -411,15 +417,10 @@ class Conversation(ChatGetter):
 
         self._last_read = event.max_id
 
-        remove_reads = []
         for msg_id, pending in list(self._pending_reads.items()):
             if msg_id >= self._last_read:
-                remove_reads.append(msg_id)
                 pending.set_result(True)
                 del self._pending_reads[msg_id]
-
-        for to_remove in remove_reads:
-            del self._pending_reads[to_remove]
 
     def _get_message_id(self, message):
         if message is not None:  # 0 is valid but false-y, check for None
